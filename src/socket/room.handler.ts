@@ -454,15 +454,30 @@ export function setupSocket(io: Server) {
       socket.emit('lobby:rooms', getLobbyRoomsList());
     });
 
-    socket.on('room:create', (data: { bet?: number }) => {
+    socket.on('room:create', async (data: { bet?: number }) => {
       const roomId = Math.floor(100000 + Math.random() * 900000).toString();
       const userId = (socket as any).userId || uuidv4().slice(0, 8);
       const username = (socket as any).username || 'Player';
+      const reqBet = data?.bet || 1000;
+
+      // Kiểm tra số dư tài khoản trước khi tạo bàn
+      try {
+        const userDb = await prisma.user.findFirst({
+          where: { OR: [{ id: userId }, { username }] },
+          include: { wallet: true }
+        });
+        const balance = userDb?.wallet ? Number(userDb.wallet.balance) : 0;
+        if (balance < reqBet) {
+          return socket.emit('error', `Số dư không đủ! Bạn hiện có ${balance.toLocaleString()} Xu (Cần ít nhất ${reqBet.toLocaleString()} Xu để tạo bàn).`);
+        }
+      } catch (err) {
+        console.error('Check wallet error on room create:', err);
+      }
 
       const newRoom: RoomState = {
         id: roomId,
         hostId: userId,
-        bet: data?.bet || 1000,
+        bet: reqBet,
         status: 'WAITING',
         players: [{ id: userId, username, isBot: false, cards: [], hasPassed: false }],
         centerCards: [],
@@ -484,8 +499,8 @@ export function setupSocket(io: Server) {
       io.to(roomId).emit('room:update', getPublicRoomState(newRoom));
     });
 
-    socket.on('room:join', (data: { roomId: string }) => {
-      const room = rooms.get(data.roomId);
+    socket.on('room:join', async (data: { roomId: string }) => {
+      const room = rooms.get(data?.roomId);
       if (!room) return socket.emit('error', 'Phòng không tồn tại!');
       if (room.players.length >= 4) return socket.emit('error', 'Phòng đã đầy!');
       if (room.status !== 'WAITING') return socket.emit('error', 'Phòng đang chơi!');
@@ -494,6 +509,20 @@ export function setupSocket(io: Server) {
       const username = (socket as any).username || 'Guest';
 
       if (!room.players.some(p => p.id === userId)) {
+        // Kiểm tra số dư tài khoản người chơi gia nhập
+        try {
+          const userDb = await prisma.user.findFirst({
+            where: { OR: [{ id: userId }, { username }] },
+            include: { wallet: true }
+          });
+          const balance = userDb?.wallet ? Number(userDb.wallet.balance) : 0;
+          if (balance < room.bet) {
+            return socket.emit('error', `Số dư không đủ! Cần ít nhất ${room.bet.toLocaleString()} Xu để vào bàn (Bạn có ${balance.toLocaleString()} Xu).`);
+          }
+        } catch (err) {
+          console.error('Check wallet error on room join:', err);
+        }
+
         room.players.push({ id: userId, username, isBot: false, cards: [], hasPassed: false });
       }
 
@@ -510,7 +539,7 @@ export function setupSocket(io: Server) {
     });
 
     socket.on('room:add_bot', (data: { roomId: string }) => {
-      const room = rooms.get(data.roomId);
+      const room = rooms.get(data?.roomId);
       if (!room) return;
       if (room.players.length >= 4) return socket.emit('error', 'Phòng đã đầy!');
 
@@ -527,13 +556,31 @@ export function setupSocket(io: Server) {
       broadcastLobbyRooms();
     });
 
-    socket.on('room:start', (data: { roomId: string }) => {
-      const room = rooms.get(data.roomId);
+    socket.on('room:start', async (data: { roomId: string }) => {
+      const room = rooms.get(data?.roomId);
       if (!room) return;
 
       const N = room.players.length;
       if (N < 2) {
         return socket.emit('error', 'Cần ít nhất 2 người chơi (hoặc thêm Bot) để bắt đầu!');
+      }
+
+      // Kiểm tra tất cả người chơi thật xem có ai thiếu xu không
+      for (const p of room.players) {
+        if (!p.isBot) {
+          try {
+            const userDb = await prisma.user.findFirst({
+              where: { OR: [{ id: p.id }, { username: p.username }] },
+              include: { wallet: true }
+            });
+            const balance = userDb?.wallet ? Number(userDb.wallet.balance) : 0;
+            if (balance < room.bet) {
+              return socket.emit('error', `Người chơi ${p.username} không đủ ${room.bet.toLocaleString()} Xu để bắt đầu ván cược!`);
+            }
+          } catch (err) {
+            console.error('Check wallet error on start:', err);
+          }
+        }
       }
 
       const deck = new Deck();
