@@ -71,40 +71,53 @@ export function setupSocket(io: Server) {
         room.hostId = nextHost.id;
       }
 
-      const remainingCount = room.players.length;
+      const remainingHumanCount = room.players.filter(p => !p.isBot).length;
+      const totalRemaining = room.players.length;
 
-      // Quy tắc: Nếu dưới 2 người chơi -> Hủy ván & Hủy bàn ngay lập tức!
-      if (remainingCount < 2) {
+      // Nếu không còn người chơi thật nào trong phòng -> Hủy bàn
+      if (totalRemaining === 0 || remainingHumanCount === 0) {
         rooms.delete(roomId);
         io.to(roomId).emit('room:cancelled', {
           roomId,
-          reason: 'Bàn đã bị hủy do không đủ 2 người chơi (có người rời phòng hoặc tắt tab).'
+          reason: 'Bàn đã bị hủy do tất cả người chơi đã rời phòng.'
         });
         broadcastLobbyRooms();
       } else {
-        // Còn từ 2 người chơi trở lên
+        // Còn ít nhất 1 người chơi thật
         if (room.status === 'PLAYING') {
-          // Cập nhật lại turnIndex nếu người rời là người đang tới lượt
-          if (room.turnIndex >= room.players.length || room.turnIndex === playerIdx) {
-            room.turnIndex = room.turnIndex % room.players.length;
-          } else if (room.turnIndex > playerIdx) {
-            room.turnIndex = room.turnIndex - 1;
-          }
-
-          // Cập nhật lại danh sách bỏ lượt
-          room.passedPlayers = room.passedPlayers
-            .filter(idx => idx !== playerIdx)
-            .map(idx => idx > playerIdx ? idx - 1 : idx);
-
-          if (room.lastPlayedTurn === playerIdx) {
-            room.lastPlayedTurn = 0;
+          if (totalRemaining < 2) {
+            // Đang chơi mà còn dưới 2 người -> Hủy ván đấu, về màn hình chờ WAITING
+            room.status = 'WAITING';
+            room.turnIndex = -1;
             room.centerCards = [];
-          } else if (room.lastPlayedTurn > playerIdx) {
-            room.lastPlayedTurn = room.lastPlayedTurn - 1;
-          }
+            room.passedPlayers = [];
+            io.to(roomId).emit('room:cancelled', {
+              roomId,
+              reason: 'Ván đấu bị hủy do không đủ 2 người chơi.'
+            });
+          } else {
+            // Cập nhật lại turnIndex nếu người rời là người đang tới lượt
+            if (room.turnIndex >= room.players.length || room.turnIndex === playerIdx) {
+              room.turnIndex = room.turnIndex % room.players.length;
+            } else if (room.turnIndex > playerIdx) {
+              room.turnIndex = room.turnIndex - 1;
+            }
 
-          io.to(roomId).emit('game:update', getPublicRoomState(room));
-          checkAndRunBotTurn(roomId);
+            // Cập nhật lại danh sách bỏ lượt
+            room.passedPlayers = room.passedPlayers
+              .filter(idx => idx !== playerIdx)
+              .map(idx => idx > playerIdx ? idx - 1 : idx);
+
+            if (room.lastPlayedTurn === playerIdx) {
+              room.lastPlayedTurn = 0;
+              room.centerCards = [];
+            } else if (room.lastPlayedTurn > playerIdx) {
+              room.lastPlayedTurn = room.lastPlayedTurn - 1;
+            }
+
+            io.to(roomId).emit('game:update', getPublicRoomState(room));
+            checkAndRunBotTurn(roomId);
+          }
         } else {
           // Trạng thái WAITING
           io.to(roomId).emit('room:update', getPublicRoomState(room));
