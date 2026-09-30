@@ -1,0 +1,73 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  username     String   @unique
+  passwordHash String
+  email        String?
+  createdAt    DateTime @default(now())
+  
+  wallet       Wallet?
+  roomRecords  RoomRecord[]
+  matchResults MatchResult[]
+}
+
+model Wallet {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @unique @db.ObjectId
+  user      User     @relation(fields: [userId], references: [id])
+  balance   BigInt   @default(0)
+  updatedAt DateTime @updatedAt
+  
+  transactions WalletTransaction[]
+}
+
+model WalletTransaction {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  walletId  String   @db.ObjectId
+  wallet    Wallet   @relation(fields: [walletId], references: [id])
+  amount    BigInt   // Dương (cộng xu), Âm (trừ xu)
+  reason    String   // VD: MATCH_WIN, MATCH_LOSS, DAILY_BONUS, CHOPPING_PENALTY
+  createdAt DateTime @default(now())
+}
+
+model RoomRecord {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  name      String
+  betAmount BigInt
+  isPrivate Boolean  @default(false)
+  password  String?
+  hostId    String   @db.ObjectId
+  host      User     @relation(fields: [hostId], references: [id])
+  createdAt DateTime @default(now())
+  
+  matches   MatchHistory[]
+}
+
+model MatchHistory {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  roomId    String   @db.ObjectId
+  room      RoomRecord @relation(fields: [roomId], references: [id])
+  startTime DateTime @default(now())
+  endTime   DateTime?
+  logs      String?  // Lưu lại lịch sử các nước đi (replay), parse từ String JSON
+  
+  results   MatchResult[]
+}
+
+model MatchResult {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  matchId   String   @db.ObjectId
+  match     MatchHistory @relation(fields: [matchId], references: [id])
+  userId    String   @db.ObjectId
+  user      User     @relation(fields: [userId], references: [id])
+  position  Int      // 1 (Nhất), 2 (Nhì), 3 (Ba), 4 (Bét)
+  coinChange BigInt
+}
