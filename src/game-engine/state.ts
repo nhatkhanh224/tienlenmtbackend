@@ -132,6 +132,10 @@ export class GameState {
       throw new Error("Không thể chặt bài này");
     }
 
+    if (Validator.wouldFinishWithPig(player.cards, playedCards)) {
+      throw new Error("Không được đánh Heo (2) để về cuối");
+    }
+
     // Đánh thành công
     this.firstTurnOfGame = false;
     this.lastPlayedCombo = combo;

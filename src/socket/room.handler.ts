@@ -5,6 +5,8 @@ import { BotAI } from '../game-engine/bot';
 import { Deck } from '../game-engine/deck';
 import { v4 as uuidv4 } from 'uuid';
 import { PrismaClient } from '@prisma/client';
+import jwt from 'jsonwebtoken';
+import { config } from '../config/env';
 
 const prisma = new PrismaClient();
 
@@ -31,12 +33,76 @@ export interface RoomState {
   playerMoveCounts?: { [playerIdx: number]: number };
   isFirstMove: boolean;
   isFirstGame: boolean;
+  isDealing: boolean;
+  dealingEndsAt: number | null;
+  isSettling: boolean;
   penaltyResults: any[];
 }
 
 export const rooms = new Map<string, RoomState>();
+const disconnectTimers = new Map<string, NodeJS.Timeout>();
+
+type RoomAck = (response: { ok: boolean; roomId?: string; error?: string }) => void;
+type SocketUser = { id: string; username: string };
+
+const DEFAULT_BET = 1000;
+const DEAL_CARD_INTERVAL_MS = 64;
+const DEAL_FINISH_BUFFER_MS = 420;
+const getDealDurationMs = (playerCount: number) => (
+  Math.min(4, Math.max(2, playerCount)) * 13 * DEAL_CARD_INTERVAL_MS + DEAL_FINISH_BUFFER_MS
+);
+
+const clearDisconnectTimer = (userId: string) => {
+  const timer = disconnectTimers.get(userId);
+  if (!timer) return;
+  clearTimeout(timer);
+  disconnectTimers.delete(userId);
+};
+
+const getAvailableRank = (room: RoomState, preferWorst = false) => {
+  const usedRanks = new Set(Object.values(room.ranks));
+  if (preferWorst) {
+    for (let rank = room.players.length; rank >= 1; rank--) {
+      if (!usedRanks.has(rank)) return rank;
+    }
+  } else {
+    for (let rank = 1; rank <= room.players.length; rank++) {
+      if (!usedRanks.has(rank)) return rank;
+    }
+  }
+  return room.players.length;
+};
+
+const assignRank = (room: RoomState, playerIdx: number, preferWorst = false) => {
+  if (room.ranks[playerIdx] !== undefined) return room.ranks[playerIdx];
+  const rank = getAvailableRank(room, preferWorst);
+  room.ranks[playerIdx] = rank;
+  if (room.players[playerIdx]) room.players[playerIdx].rank = rank;
+  return rank;
+};
+
+const getSocketUser = (socket: Socket): SocketUser | null => {
+  const user = (socket.data as { user?: SocketUser }).user;
+  return user?.id && user?.username ? user : null;
+};
+
+const rejectRequest = (socket: Socket, ack: RoomAck | undefined, message: string) => {
+  if (ack) ack({ ok: false, error: message });
+  else socket.emit('error', message);
+};
 
 export function setupSocket(io: Server) {
+
+  const getWalletBalance = async (userId: string) => {
+    // Older accounts may predate the wallet feature. Upsert makes their state
+    // consistent with newly registered accounts instead of reporting a fake 0.
+    const wallet = await prisma.wallet.upsert({
+      where: { userId },
+      update: {},
+      create: { userId, balance: 10000 }
+    });
+    return Number(wallet.balance);
+  };
 
   const getLobbyRoomsList = () => {
     return Array.from(rooms.values()).map(r => ({
@@ -44,12 +110,18 @@ export function setupSocket(io: Server) {
       playersCount: r.players.length,
       status: r.status,
       bet: r.bet,
-      hostName: r.players[0]?.username || 'Host'
+      hostName: r.players.find(p => p.id === r.hostId)?.username || 'Host'
     }));
   };
 
   const broadcastLobbyRooms = () => {
     io.emit('lobby:rooms', getLobbyRoomsList());
+  };
+
+  const leaveSocketGameRooms = (socket: Socket) => {
+    for (const joinedRoomId of socket.rooms) {
+      if (joinedRoomId !== socket.id) socket.leave(joinedRoomId);
+    }
   };
 
   const handlePlayerLeaveRoom = (userId: string, targetRoomId?: string) => {
@@ -62,7 +134,21 @@ export function setupSocket(io: Server) {
       if (playerIdx === -1) continue;
 
       // Xóa người chơi rời phòng
+      const previousMoveCounts = room.playerMoveCounts || {};
       room.players.splice(playerIdx, 1);
+
+      // Các trạng thái lượt/xếp hạng dùng index ghế, nên phải đánh lại index sau
+      // khi một người rời phòng để người còn lại không bị lệch lượt hoặc hạng.
+      room.ranks = Object.fromEntries(
+        Object.entries(room.ranks)
+          .filter(([idx]) => Number(idx) !== playerIdx)
+          .map(([idx, rank]) => [Number(idx) > playerIdx ? Number(idx) - 1 : Number(idx), rank])
+      );
+      room.playerMoveCounts = Object.fromEntries(
+        Object.entries(previousMoveCounts)
+          .filter(([idx]) => Number(idx) !== playerIdx)
+          .map(([idx, count]) => [Number(idx) > playerIdx ? Number(idx) - 1 : Number(idx), count])
+      );
 
       // Nếu người rời phòng là Chủ phòng -> Chuyển quyền chủ phòng cho người tiếp theo (người thứ 2)
       const wasHost = room.hostId === userId;
@@ -91,6 +177,8 @@ export function setupSocket(io: Server) {
             room.turnIndex = -1;
             room.centerCards = [];
             room.passedPlayers = [];
+            room.isDealing = false;
+            room.dealingEndsAt = null;
             io.to(roomId).emit('room:cancelled', {
               roomId,
               reason: 'Ván đấu bị hủy do không đủ 2 người chơi.'
@@ -115,12 +203,12 @@ export function setupSocket(io: Server) {
               room.lastPlayedTurn = room.lastPlayedTurn - 1;
             }
 
-            io.to(roomId).emit('game:update', getPublicRoomState(room));
+            emitRoomState(room, 'game:update');
             checkAndRunBotTurn(roomId);
           }
         } else {
           // Trạng thái WAITING
-          io.to(roomId).emit('room:update', getPublicRoomState(room));
+          emitRoomState(room, 'room:update');
         }
         broadcastLobbyRooms();
       }
@@ -226,19 +314,15 @@ export function setupSocket(io: Server) {
 
       if (!player.isBot && player.id) {
         try {
-          const dbUser = await prisma.user.findFirst({
-            where: {
-              OR: [
-                { id: player.id },
-                { username: player.username }
-              ]
-            },
-            include: { wallet: true }
+          const wallet = await prisma.wallet.upsert({
+            where: { userId: player.id },
+            update: {},
+            create: { userId: player.id, balance: 10000 }
           });
 
-          if (dbUser && dbUser.wallet) {
+          if (wallet) {
             const updatedWallet = await prisma.wallet.update({
-              where: { id: dbUser.wallet.id },
+              where: { id: wallet.id },
               data: {
                 balance: {
                   increment: BigInt(coinChange)
@@ -250,7 +334,7 @@ export function setupSocket(io: Server) {
 
             await prisma.walletTransaction.create({
               data: {
-                walletId: dbUser.wallet.id,
+                walletId: wallet.id,
                 amount: BigInt(coinChange),
                 reason: i === winnerIdx 
                   ? (isToiTrang ? 'MATCH_TOI_TRANG_WIN' : 'MATCH_WIN') 
@@ -278,7 +362,7 @@ export function setupSocket(io: Server) {
 
   const checkAndRunBotTurn = (roomId: string) => {
     const room = rooms.get(roomId);
-    if (!room || room.status !== 'PLAYING') return;
+    if (!room || room.status !== 'PLAYING' || room.isDealing) return;
 
     const currentP = room.players[room.turnIndex];
     if (!currentP || !currentP.isBot || currentP.cards.length === 0) return;
@@ -287,7 +371,7 @@ export function setupSocket(io: Server) {
 
     setTimeout(async () => {
       const r = rooms.get(roomId);
-      if (!r || r.status !== 'PLAYING' || r.turnIndex !== targetTurn) return;
+      if (!r || r.status !== 'PLAYING' || r.isDealing || r.turnIndex !== targetTurn) return;
 
       const bot = r.players[r.turnIndex];
       if (!bot || !bot.isBot || bot.cards.length === 0) return;
@@ -300,7 +384,11 @@ export function setupSocket(io: Server) {
       if (playedCards.length === 0) {
         processPass(r, r.turnIndex);
       } else {
-        await processPlay(r, r.turnIndex, playedCards);
+        const result = await processPlay(r, r.turnIndex, playedCards);
+        if (!result.ok) {
+          console.warn(`Bot ${bot.username} bỏ nước đánh không hợp lệ: ${result.error}`);
+          if (r.centerCards.length > 0) processPass(r, r.turnIndex);
+        }
       }
     }, 1000);
   };
@@ -337,13 +425,21 @@ export function setupSocket(io: Server) {
 
     room.turnIndex = nextTurn;
 
-    io.to(room.id).emit('game:update', getPublicRoomState(room));
+    emitRoomState(room, 'game:update');
     checkAndRunBotTurn(room.id);
   };
 
   const processPlay = async (room: RoomState, playerIdx: number, playedCards: Card[]) => {
+    if (room.isDealing) {
+      return { ok: false as const, error: 'Đang chia bài, chưa thể đánh!' };
+    }
+
     const p = room.players[playerIdx];
-    if (!p) return;
+    if (!p) return { ok: false as const, error: 'Người chơi không tồn tại!' };
+
+    if (Validator.wouldFinishWithPig(p.cards, playedCards)) {
+      return { ok: false as const, error: 'Không được đánh Heo (2) để về cuối!' };
+    }
 
     if (room.isFirstMove) {
       room.isFirstMove = false;
@@ -363,30 +459,45 @@ export function setupSocket(io: Server) {
 
     // Check hết bài -> xếp hạng
     if (p.cards.length === 0 && room.ranks[playerIdx] === undefined) {
-      const rank = Object.keys(room.ranks).length + 1;
-      room.ranks[playerIdx] = rank;
-      p.rank = rank;
+      assignRank(room, playerIdx);
+    } else if (p.cards.length === 1 && p.cards[0].value === 15 && room.ranks[playerIdx] === undefined) {
+      // Chỉ còn đúng một lá Heo thì không còn nước đi hợp lệ để về. Xếp người
+      // chơi vào hạng thấp nhất còn trống và giữ lá Heo để tính tiền thối.
+      assignRank(room, playerIdx, true);
     }
 
     const N = room.players.length;
 
     // Check end game (khi N-1 người đã về đích)
     if (Object.keys(room.ranks).length >= N - 1) {
-      const loser = Array.from({ length: N }, (_, i) => i).find(idx => room.ranks[idx] === undefined);
-      if (loser !== undefined) {
-        room.ranks[loser] = N;
-        if (room.players[loser]) room.players[loser].rank = N;
+      const remainingPlayer = Array.from({ length: N }, (_, i) => i).find(idx => room.ranks[idx] === undefined);
+      if (remainingPlayer !== undefined) {
+        assignRank(room, remainingPlayer);
       }
       room.status = 'FINISHED';
       room.turnIndex = -1;
+      room.isDealing = false;
+      room.dealingEndsAt = null;
       room.isFirstGame = false;
-      
-      // Tính tiền đền & trừ/cộng xu thật vào DB theo Luật Tiến Lên Miền Trung
-      room.penaltyResults = await calculateAndSettlePenalties(room);
+      room.isSettling = true;
+      room.penaltyResults = [];
 
-      io.to(room.id).emit('game:update', getPublicRoomState(room));
+      // Khóa giao diện ngay; không chờ các truy vấn ví/DB hoàn tất.
+      emitRoomState(room, 'game:update');
       broadcastLobbyRooms();
-      return;
+
+      // Tính tiền đền & trừ/cộng xu thật vào DB theo Luật Tiến Lên Miền Trung
+      try {
+        room.penaltyResults = await calculateAndSettlePenalties(room);
+      } catch (error) {
+        console.error('Settle game error:', error);
+        room.penaltyResults = [];
+      } finally {
+        room.isSettling = false;
+      }
+
+      emitRoomState(room, 'game:update');
+      return { ok: true as const };
     }
 
     // Next turn
@@ -413,11 +524,12 @@ export function setupSocket(io: Server) {
 
     room.turnIndex = nextTurn;
 
-    io.to(room.id).emit('game:update', getPublicRoomState(room));
+    emitRoomState(room, 'game:update');
     checkAndRunBotTurn(room.id);
+    return { ok: true as const };
   };
 
-  const getPublicRoomState = (room: RoomState) => {
+  const getPublicRoomState = (room: RoomState, viewerId?: string) => {
     return {
       id: room.id,
       hostId: room.hostId,
@@ -429,57 +541,94 @@ export function setupSocket(io: Server) {
       passedPlayers: room.passedPlayers,
       ranks: room.ranks,
       isFirstMove: room.isFirstMove,
+      isDealing: room.isDealing,
+      dealingEndsAt: room.dealingEndsAt,
+      isSettling: room.isSettling,
       penaltyResults: room.penaltyResults || [],
       players: room.players.map(p => ({
         id: p.id,
         username: p.username,
         isBot: p.isBot,
-        cardCount: p.cards.length,
         rank: p.rank,
-        cards: p.cards
+        // A client only receives its own hand. Opponent hands must never be
+        // included in a broadcast payload.
+        cards: p.id === viewerId ? p.cards : []
       }))
     };
   };
 
+  const emitRoomState = (room: RoomState, event: 'room:update' | 'game:started' | 'game:update') => {
+    const socketIds = io.sockets.adapter.rooms.get(room.id);
+    if (!socketIds) return;
+
+    for (const socketId of socketIds) {
+      const targetSocket = io.sockets.sockets.get(socketId);
+      if (!targetSocket) continue;
+      const viewer = getSocketUser(targetSocket);
+      targetSocket.emit(event, getPublicRoomState(room, viewer?.id));
+    }
+  };
+
   io.on('connection', (socket: Socket) => {
 
-    socket.on('auth', (data: { userId: string; username: string }) => {
-      (socket as any).userId = data.userId;
-      (socket as any).username = data.username;
+    socket.on('auth', (data: { token?: string }, ack?: (response: { ok: boolean; userId?: string; username?: string; error?: string }) => void) => {
+      try {
+        if (!data?.token) throw new Error('Missing token');
+        const payload = jwt.verify(data.token, config.jwtSecret) as { id?: string; username?: string };
+        if (!payload.id || !payload.username) throw new Error('Invalid token payload');
 
-      socket.emit('lobby:rooms', getLobbyRoomsList());
+        const previousUser = getSocketUser(socket);
+        if (previousUser && previousUser.id !== payload.id) {
+          handlePlayerLeaveRoom(previousUser.id);
+          leaveSocketGameRooms(socket);
+        }
+        socket.data.user = { id: payload.id, username: payload.username } satisfies SocketUser;
+        ack?.({ ok: true, userId: payload.id, username: payload.username });
+        socket.emit('lobby:rooms', getLobbyRoomsList());
+      } catch {
+        delete socket.data.user;
+        ack?.({ ok: false, error: 'Phiên đăng nhập không hợp lệ hoặc đã hết hạn.' });
+      }
     });
 
     socket.on('lobby:get_rooms', () => {
       socket.emit('lobby:rooms', getLobbyRoomsList());
     });
 
-    socket.on('room:create', async (data: { bet?: number }) => {
-      const roomId = Math.floor(100000 + Math.random() * 900000).toString();
-      const userId = (socket as any).userId || uuidv4().slice(0, 8);
-      const username = (socket as any).username || 'Player';
-      const reqBet = data?.bet || 1000;
+    socket.on('room:create', async (data: { bet?: number }, ack?: RoomAck) => {
+      const user = getSocketUser(socket);
+      if (!user) return rejectRequest(socket, ack, 'Bạn cần đăng nhập lại trước khi tạo bàn.');
 
-      // Kiểm tra số dư tài khoản trước khi tạo bàn
+      const reqBet = data?.bet ?? DEFAULT_BET;
+      if (!Number.isSafeInteger(reqBet) || reqBet <= 0) {
+        return rejectRequest(socket, ack, 'Mức cược không hợp lệ.');
+      }
+
       try {
-        const userDb = await prisma.user.findFirst({
-          where: { OR: [{ id: userId }, { username }] },
-          include: { wallet: true }
-        });
-        const balance = userDb?.wallet ? Number(userDb.wallet.balance) : 0;
+        const balance = await getWalletBalance(user.id);
         if (balance < reqBet) {
-          return socket.emit('error', `Số dư không đủ! Bạn hiện có ${balance.toLocaleString()} Xu (Cần ít nhất ${reqBet.toLocaleString()} Xu để tạo bàn).`);
+          return rejectRequest(socket, ack, `Số dư không đủ! Bạn hiện có ${balance.toLocaleString()} Xu (Cần ít nhất ${reqBet.toLocaleString()} Xu để tạo bàn).`);
         }
       } catch (err) {
         console.error('Check wallet error on room create:', err);
+        return rejectRequest(socket, ack, 'Không thể kiểm tra số dư. Vui lòng thử lại sau.');
       }
+
+      // A user can only occupy one active room at a time.
+      handlePlayerLeaveRoom(user.id);
+      leaveSocketGameRooms(socket);
+
+      let roomId: string;
+      do {
+        roomId = Math.floor(100000 + Math.random() * 900000).toString();
+      } while (rooms.has(roomId));
 
       const newRoom: RoomState = {
         id: roomId,
-        hostId: userId,
+        hostId: user.id,
         bet: reqBet,
         status: 'WAITING',
-        players: [{ id: userId, username, isBot: false, cards: [], hasPassed: false }],
+        players: [{ id: user.id, username: user.username, isBot: false, cards: [], hasPassed: false }],
         centerCards: [],
         turnIndex: -1,
         lastPlayedTurn: 0,
@@ -488,60 +637,78 @@ export function setupSocket(io: Server) {
         playerMoveCounts: {},
         isFirstMove: true,
         isFirstGame: true,
+        isDealing: false,
+        dealingEndsAt: null,
+        isSettling: false,
         penaltyResults: []
       };
 
       rooms.set(roomId, newRoom);
       socket.join(roomId);
+      clearDisconnectTimer(user.id);
 
-      socket.emit('room:created', { roomId });
+      ack?.({ ok: true, roomId });
       broadcastLobbyRooms();
-      io.to(roomId).emit('room:update', getPublicRoomState(newRoom));
+      emitRoomState(newRoom, 'room:update');
     });
 
-    socket.on('room:join', async (data: { roomId: string }) => {
+    socket.on('room:join', async (data: { roomId: string }, ack?: RoomAck) => {
+      const user = getSocketUser(socket);
+      if (!user) return rejectRequest(socket, ack, 'Bạn cần đăng nhập lại trước khi vào bàn.');
+
       const room = rooms.get(data?.roomId);
-      if (!room) return socket.emit('error', 'Phòng không tồn tại!');
-      if (room.players.length >= 4) return socket.emit('error', 'Phòng đã đầy!');
-      if (room.status !== 'WAITING') return socket.emit('error', 'Phòng đang chơi!');
+      if (!room) return rejectRequest(socket, ack, 'Phòng không tồn tại!');
 
-      const userId = (socket as any).userId || uuidv4().slice(0, 8);
-      const username = (socket as any).username || 'Guest';
-
-      if (!room.players.some(p => p.id === userId)) {
-        // Kiểm tra số dư tài khoản người chơi gia nhập
-        try {
-          const userDb = await prisma.user.findFirst({
-            where: { OR: [{ id: userId }, { username }] },
-            include: { wallet: true }
-          });
-          const balance = userDb?.wallet ? Number(userDb.wallet.balance) : 0;
-          if (balance < room.bet) {
-            return socket.emit('error', `Số dư không đủ! Cần ít nhất ${room.bet.toLocaleString()} Xu để vào bàn (Bạn có ${balance.toLocaleString()} Xu).`);
-          }
-        } catch (err) {
-          console.error('Check wallet error on room join:', err);
-        }
-
-        room.players.push({ id: userId, username, isBot: false, cards: [], hasPassed: false });
+      const existingPlayer = room.players.some(p => p.id === user.id);
+      if (existingPlayer) {
+        socket.join(room.id);
+        clearDisconnectTimer(user.id);
+        ack?.({ ok: true, roomId: room.id });
+        emitRoomState(room, room.status === 'WAITING' ? 'room:update' : 'game:update');
+        return;
       }
+
+      if (room.players.length >= 4) return rejectRequest(socket, ack, 'Phòng đã đầy!');
+      if (room.status !== 'WAITING') return rejectRequest(socket, ack, 'Phòng đang chơi!');
+
+      try {
+        const balance = await getWalletBalance(user.id);
+        if (balance < room.bet) {
+          return rejectRequest(socket, ack, `Số dư không đủ! Cần ít nhất ${room.bet.toLocaleString()} Xu để vào bàn (Bạn có ${balance.toLocaleString()} Xu).`);
+        }
+      } catch (err) {
+        console.error('Check wallet error on room join:', err);
+        return rejectRequest(socket, ack, 'Không thể kiểm tra số dư. Vui lòng thử lại sau.');
+      }
+
+      handlePlayerLeaveRoom(user.id);
+      leaveSocketGameRooms(socket);
+      room.players.push({ id: user.id, username: user.username, isBot: false, cards: [], hasPassed: false });
 
       socket.join(data.roomId);
-      io.to(data.roomId).emit('room:update', getPublicRoomState(room));
+      clearDisconnectTimer(user.id);
+      ack?.({ ok: true, roomId: room.id });
+      emitRoomState(room, 'room:update');
       broadcastLobbyRooms();
     });
 
-    socket.on('room:leave', (data: { roomId: string }) => {
-      const userId = (socket as any).userId;
-      if (userId) {
-        handlePlayerLeaveRoom(userId, data?.roomId);
-      }
+    socket.on('room:leave', (data: { roomId: string }, ack?: RoomAck) => {
+      const user = getSocketUser(socket);
+      if (!user) return rejectRequest(socket, ack, 'Bạn cần đăng nhập lại!');
+
+      clearDisconnectTimer(user.id);
+      socket.leave(data?.roomId);
+      handlePlayerLeaveRoom(user.id, data?.roomId);
+      ack?.({ ok: true, roomId: data?.roomId });
     });
 
-    socket.on('room:add_bot', (data: { roomId: string }) => {
+    socket.on('room:add_bot', (data: { roomId: string }, ack?: RoomAck) => {
       const room = rooms.get(data?.roomId);
-      if (!room) return;
-      if (room.players.length >= 4) return socket.emit('error', 'Phòng đã đầy!');
+      if (!room) return rejectRequest(socket, ack, 'Phòng không tồn tại!');
+      const user = getSocketUser(socket);
+      if (!user || room.hostId !== user.id) return rejectRequest(socket, ack, 'Chỉ chủ phòng mới được thêm Bot!');
+      if (room.status !== 'WAITING') return rejectRequest(socket, ack, 'Không thể thêm Bot khi ván đang diễn ra!');
+      if (room.players.length >= 4) return rejectRequest(socket, ack, 'Phòng đã đầy!');
 
       const botNum = room.players.filter(p => p.isBot).length + 1;
       room.players.push({
@@ -552,36 +719,40 @@ export function setupSocket(io: Server) {
         hasPassed: false
       });
 
-      io.to(data.roomId).emit('room:update', getPublicRoomState(room));
+      emitRoomState(room, 'room:update');
       broadcastLobbyRooms();
+      ack?.({ ok: true, roomId: room.id });
     });
 
-    socket.on('room:start', async (data: { roomId: string }) => {
+    socket.on('room:start', async (data: { roomId: string }, ack?: RoomAck) => {
       const room = rooms.get(data?.roomId);
-      if (!room) return;
+      if (!room) return rejectRequest(socket, ack, 'Phòng không tồn tại!');
+      const user = getSocketUser(socket);
+      if (!user || room.hostId !== user.id) return rejectRequest(socket, ack, 'Chỉ chủ phòng mới được bắt đầu ván!');
+      if (room.status !== 'WAITING' && room.status !== 'FINISHED') return rejectRequest(socket, ack, 'Ván đấu đã bắt đầu!');
+      if (room.isSettling) return rejectRequest(socket, ack, 'Ván cũ đang được tổng kết. Vui lòng chờ trong giây lát!');
 
       const N = room.players.length;
       if (N < 2) {
-        return socket.emit('error', 'Cần ít nhất 2 người chơi (hoặc thêm Bot) để bắt đầu!');
+        return rejectRequest(socket, ack, 'Cần ít nhất 2 người chơi (hoặc thêm Bot) để bắt đầu!');
       }
 
       // Kiểm tra tất cả người chơi thật xem có ai thiếu xu không
       for (const p of room.players) {
         if (!p.isBot) {
           try {
-            const userDb = await prisma.user.findFirst({
-              where: { OR: [{ id: p.id }, { username: p.username }] },
-              include: { wallet: true }
-            });
-            const balance = userDb?.wallet ? Number(userDb.wallet.balance) : 0;
+            const balance = await getWalletBalance(p.id);
             if (balance < room.bet) {
-              return socket.emit('error', `Người chơi ${p.username} không đủ ${room.bet.toLocaleString()} Xu để bắt đầu ván cược!`);
+              return rejectRequest(socket, ack, `Người chơi ${p.username} không đủ ${room.bet.toLocaleString()} Xu để bắt đầu ván cược!`);
             }
           } catch (err) {
             console.error('Check wallet error on start:', err);
+            return rejectRequest(socket, ack, 'Không thể kiểm tra số dư người chơi. Vui lòng thử lại sau.');
           }
         }
       }
+
+      const previousWinner = room.players.findIndex(p => p.rank === 1);
 
       const deck = new Deck();
       deck.initialize();
@@ -599,6 +770,11 @@ export function setupSocket(io: Server) {
       room.centerCards = [];
       room.lastPlayedTurn = 0;
       room.penaltyResults = [];
+      room.isSettling = false;
+      room.isDealing = true;
+      const dealDurationMs = getDealDurationMs(N);
+      const dealingEndsAt = Date.now() + dealDurationMs;
+      room.dealingEndsAt = dealingEndsAt;
       room.playerMoveCounts = { 0: 0, 1: 0, 2: 0, 3: 0 };
 
       let startingPlayer = 0;
@@ -626,35 +802,67 @@ export function setupSocket(io: Server) {
         }
       } else {
         room.isFirstMove = false;
-        const prevWinner = room.players.findIndex(p => p.rank === 1);
-        startingPlayer = prevWinner !== -1 ? prevWinner : 0;
+        startingPlayer = previousWinner !== -1 ? previousWinner : 0;
       }
 
       room.turnIndex = startingPlayer;
 
-      io.to(data.roomId).emit('game:started', getPublicRoomState(room));
+      emitRoomState(room, 'game:started');
       broadcastLobbyRooms();
+      ack?.({ ok: true, roomId: room.id });
 
-      checkAndRunBotTurn(data.roomId);
+      // The server owns this lock: neither a player nor a bot may move before
+      // every card in the dealing animation has reached a seat.
+      setTimeout(() => {
+        const currentRoom = rooms.get(data.roomId);
+        if (
+          !currentRoom
+          || currentRoom.status !== 'PLAYING'
+          || !currentRoom.isDealing
+          || currentRoom.dealingEndsAt !== dealingEndsAt
+        ) return;
+
+        currentRoom.isDealing = false;
+        currentRoom.dealingEndsAt = null;
+        emitRoomState(currentRoom, 'game:update');
+        checkAndRunBotTurn(currentRoom.id);
+      }, dealDurationMs);
     });
 
     socket.on('game:play', async (data: { roomId: string; cards: { value: number; suit: number }[] }) => {
       try {
         const room = rooms.get(data?.roomId);
-        if (!room || room.status !== 'PLAYING') return;
+        if (!room) return socket.emit('error', 'Phòng không tồn tại!');
+        if (room.status !== 'PLAYING') return socket.emit('error', 'Ván bài đã kết thúc!');
+        if (room.isDealing) return socket.emit('error', 'Đang chia bài, chưa thể đánh!');
 
-        const userId = (socket as any).userId;
-        const playerIdx = room.players.findIndex(p => p.id === userId);
+        const user = getSocketUser(socket);
+        if (!user) return socket.emit('error', 'Bạn cần đăng nhập lại!');
+        const playerIdx = room.players.findIndex(p => p.id === user.id);
 
         if (playerIdx === -1 || playerIdx !== room.turnIndex) {
           return socket.emit('error', 'Chưa tới lượt của bạn!');
+        }
+        if (room.ranks[playerIdx] !== undefined) {
+          return socket.emit('error', 'Bạn đã được xếp hạng và không thể đánh tiếp!');
         }
 
         if (!data.cards || !Array.isArray(data.cards) || data.cards.length === 0) {
           return socket.emit('error', 'Vui lòng chọn lá bài cần đánh!');
         }
 
-        const playedCards = data.cards.map(c => new Card(Number(c.value), Number(c.suit)));
+        const normalizedCards = data.cards.map(c => ({ value: Number(c.value), suit: Number(c.suit) }));
+        if (normalizedCards.some(c => !Number.isInteger(c.value) || c.value < 3 || c.value > 15 || !Number.isInteger(c.suit) || c.suit < 0 || c.suit > 3)) {
+          return socket.emit('error', 'Dữ liệu lá bài không hợp lệ!');
+        }
+
+        const requestedKeys = normalizedCards.map(c => `${c.value}-${c.suit}`);
+        const handKeys = new Set(room.players[playerIdx].cards.map(c => `${c.value}-${c.suit}`));
+        if (new Set(requestedKeys).size !== requestedKeys.length || requestedKeys.some(key => !handKeys.has(key))) {
+          return socket.emit('error', 'Bạn không sở hữu một hoặc nhiều lá bài đã chọn!');
+        }
+
+        const playedCards = normalizedCards.map(c => new Card(c.value, c.suit));
         const combo = Validator.getCombo(playedCards);
 
         if (combo.type === ComboType.INVALID) {
@@ -678,7 +886,8 @@ export function setupSocket(io: Server) {
           }
         }
 
-        await processPlay(room, playerIdx, playedCards);
+        const result = await processPlay(room, playerIdx, playedCards);
+        if (!result.ok) socket.emit('error', result.error);
       } catch (err: any) {
         console.error('game:play error:', err);
         socket.emit('error', err.message || 'Lỗi khi đánh bài');
@@ -688,13 +897,19 @@ export function setupSocket(io: Server) {
     socket.on('game:pass', (data: { roomId: string }) => {
       try {
         const room = rooms.get(data?.roomId);
-        if (!room || room.status !== 'PLAYING') return;
+        if (!room) return socket.emit('error', 'Phòng không tồn tại!');
+        if (room.status !== 'PLAYING') return socket.emit('error', 'Ván bài đã kết thúc!');
+        if (room.isDealing) return socket.emit('error', 'Đang chia bài, chưa thể bỏ lượt!');
 
-        const userId = (socket as any).userId;
-        const playerIdx = room.players.findIndex(p => p.id === userId);
+        const user = getSocketUser(socket);
+        if (!user) return socket.emit('error', 'Bạn cần đăng nhập lại!');
+        const playerIdx = room.players.findIndex(p => p.id === user.id);
 
         if (playerIdx === -1 || playerIdx !== room.turnIndex) {
           return socket.emit('error', 'Chưa tới lượt của bạn!');
+        }
+        if (room.ranks[playerIdx] !== undefined) {
+          return socket.emit('error', 'Bạn đã được xếp hạng và không thể bỏ lượt!');
         }
 
         processPass(room, playerIdx);
@@ -705,9 +920,46 @@ export function setupSocket(io: Server) {
     });
 
     socket.on('disconnect', () => {
-      const userId = (socket as any).userId;
-      if (userId) {
-        handlePlayerLeaveRoom(userId);
+      const user = getSocketUser(socket);
+      if (user) {
+        clearDisconnectTimer(user.id);
+
+        const joinedRoomIds = Array.from(rooms.values())
+          .filter(room => room.players.some(player => player.id === user.id))
+          .map(room => room.id);
+        if (joinedRoomIds.length === 0) {
+          broadcastLobbyRooms();
+          return;
+        }
+
+        const delayedRoomIds: string[] = [];
+        for (const roomId of joinedRoomIds) {
+          const room = rooms.get(roomId);
+          if (!room) continue;
+
+          const hasAnotherConnectionInRoom = Array.from(io.sockets.sockets.values())
+            .some(otherSocket => getSocketUser(otherSocket)?.id === user.id && otherSocket.rooms.has(roomId));
+          if (hasAnotherConnectionInRoom) continue;
+
+          // Chủ phòng thoát phải được chuyển quyền/xóa bàn ngay để sảnh không
+          // còn hiển thị phòng ma. Người chơi thường vẫn có khoảng đệm reconnect.
+          if (room.hostId === user.id) handlePlayerLeaveRoom(user.id, roomId);
+          else delayedRoomIds.push(roomId);
+        }
+
+        if (delayedRoomIds.length === 0) return;
+
+        // Chỉ người chơi thường được giữ khoảng đệm reconnect; chủ phòng đã
+        // được xử lý ngay ở trên để sảnh không giữ phòng ma.
+        const timer = setTimeout(() => {
+          disconnectTimers.delete(user.id);
+          for (const roomId of delayedRoomIds) {
+            const hasAnotherConnectionInRoom = Array.from(io.sockets.sockets.values())
+              .some(otherSocket => getSocketUser(otherSocket)?.id === user.id && otherSocket.rooms.has(roomId));
+            if (!hasAnotherConnectionInRoom) handlePlayerLeaveRoom(user.id, roomId);
+          }
+        }, 15000);
+        disconnectTimers.set(user.id, timer);
       } else {
         broadcastLobbyRooms();
       }

@@ -35,6 +35,31 @@ export class Validator {
     return [...instances].sort((a, b) => a.isGreaterThan(b) ? 1 : -1);
   }
 
+  // Luật miền Trung: không được dùng Heo (2) trong nước đánh làm hết bài.
+  static wouldFinishWithPig(hand: Card[], playedCards: Card[]): boolean {
+    if (!hand || !playedCards || hand.length === 0 || hand.length !== playedCards.length) return false;
+
+    const remainingCards = new Map<string, number>();
+    for (const rawCard of hand) {
+      const card = this.ensureCard(rawCard);
+      const key = `${card.value}-${card.suit}`;
+      remainingCards.set(key, (remainingCards.get(key) || 0) + 1);
+    }
+
+    let containsPig = false;
+    for (const rawCard of playedCards) {
+      const card = this.ensureCard(rawCard);
+      const key = `${card.value}-${card.suit}`;
+      const count = remainingCards.get(key) || 0;
+      if (count === 0) return false;
+      if (count === 1) remainingCards.delete(key);
+      else remainingCards.set(key, count - 1);
+      if (card.value === 15) containsPig = true;
+    }
+
+    return containsPig && remainingCards.size === 0;
+  }
+
   // Lấy ra loại bộ (Combo) của danh sách lá bài
   static getCombo(cards: Card[]): Combo {
     if (!cards || cards.length === 0) return { type: ComboType.INVALID, cards: [], highestCard: new Card(0,0) };
@@ -298,21 +323,21 @@ export class Validator {
     if (!hand || hand.length === 0) return [];
 
     const cardInstances = hand.map(c => this.ensureCard(c));
-    const allCombos = this.getAllValidCombos(cardInstances);
+    const allCombos = this.getAllValidCombos(cardInstances)
+      .filter(combo => !this.wouldFinishWithPig(cardInstances, combo.cards));
     const has3SpadesInHand = cardInstances.some(c => c.value === 3 && c.suit === 0);
 
     if (!centerCombo || centerCombo.cards.length === 0) {
-      if (isFirstMove && has3SpadesInHand) {
-        const validCombos = allCombos.filter(cb => cb.cards.some(c => c.value === 3 && c.suit === 0));
-        const playableCardSet = new Set<string>();
-        for (const cb of validCombos) {
-          for (const c of cb.cards) {
-            playableCardSet.add(`${c.value}-${c.suit}`);
-          }
+      const validCombos = isFirstMove && has3SpadesInHand
+        ? allCombos.filter(cb => cb.cards.some(c => c.value === 3 && c.suit === 0))
+        : allCombos;
+      const playableCardSet = new Set<string>();
+      for (const cb of validCombos) {
+        for (const c of cb.cards) {
+          playableCardSet.add(`${c.value}-${c.suit}`);
         }
-        return cardInstances.map((c, i) => playableCardSet.has(`${c.value}-${c.suit}`) ? i : -1).filter(i => i !== -1);
       }
-      return cardInstances.map((_, i) => i);
+      return cardInstances.map((c, i) => playableCardSet.has(`${c.value}-${c.suit}`) ? i : -1).filter(i => i !== -1);
     }
 
     let validCombos = allCombos.filter(cb => this.canPlay(cb, centerCombo));

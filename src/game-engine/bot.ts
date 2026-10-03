@@ -151,8 +151,9 @@ export class BotAI {
   static getBestMove(hand: Card[], centerCombo: Combo | null, isNewRound: boolean, isFirstMove: boolean = false): Card[] {
     const sortedHand = Validator.sortCards(hand);
     const extracted = this.extractCombos(sortedHand);
+    const isAllowedMove = (cards: Card[]) => !Validator.wouldFinishWithPig(sortedHand, cards);
     
-    const allSortedCombos = extracted.allCombos.sort((a, b) => {
+    const allSortedCombos = extracted.allCombos.filter(isAllowedMove).sort((a, b) => {
         const aMin = Math.min(...a.map(c => c.value));
         const bMin = Math.min(...b.map(c => c.value));
         return aMin - bMin;
@@ -168,7 +169,8 @@ export class BotAI {
       const smallestCard = sortedHand[0];
       const comboWithSmallest = allSortedCombos.find(combo => combo.some(c => c.value === smallestCard.value && c.suit === smallestCard.suit));
       if (comboWithSmallest) return comboWithSmallest;
-      return [smallestCard];
+      const fallbackMove = [smallestCard];
+      return isAllowedMove(fallbackMove) ? fallbackMove : [];
     }
 
     for (const comboCards of allSortedCombos) {
@@ -182,7 +184,7 @@ export class BotAI {
     }
 
     if (centerCombo.type === ComboType.SINGLE) {
-      const validSingles = sortedHand.filter(c => c.isGreaterThan(centerCombo.highestCard));
+      const validSingles = sortedHand.filter(c => c.isGreaterThan(centerCombo.highestCard) && isAllowedMove([c]));
       if (validSingles.length > 0) {
         return [validSingles[0]];
       }
@@ -202,7 +204,7 @@ export class BotAI {
         if (cards.length >= 2) {
           const candidatePair = [cards[0], cards[1]];
           const combo = Validator.getCombo(candidatePair);
-          if (Validator.canPlay(combo, centerCombo)) {
+          if (Validator.canPlay(combo, centerCombo) && isAllowedMove(candidatePair)) {
             validPairs.push(candidatePair);
           }
         }

@@ -7,13 +7,11 @@ const prisma = new PrismaClient();
 export const getBalance = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user.id;
-    const wallet = await prisma.wallet.findUnique({
-      where: { userId }
+    const wallet = await prisma.wallet.upsert({
+      where: { userId },
+      update: {},
+      create: { userId, balance: 10000 }
     });
-
-    if (!wallet) {
-      return res.status(404).json({ error: 'Wallet not found' });
-    }
 
     res.json({ balance: wallet.balance.toString() }); // Trả về dạng string vì BigInt không tự serialize JSON được
   } catch (error: any) {
